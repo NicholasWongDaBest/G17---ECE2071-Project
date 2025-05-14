@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -53,6 +54,7 @@ UART_HandleTypeDef huart2;
 uint8_t RX_Buffer[2] = {0};
 uint16_t ADC_output = 0;
 uint16_t ADC_filter_buffer[3] = {0}; //store moving avg value
+uint16_t median_buffer[3] = {0}; //store moving avg value
 char string_1[40] = "\0";
 uint8_t buffer_index = 0;
 uint8_t initialized = 0;
@@ -60,13 +62,14 @@ int flag = 0;
 float distance = 0;
 uint16_t count_1 = 0;
 uint16_t count_2 = 0;
-int min_distance = 10;
-uint8_t uart_buffer[1]={0};
+int min_distance = 0;
+uint8_t uart_buffer;
 uint8_t distance_mode = 0;  // 1 = ON, 0 = OFF
 uint8_t recording_enabled = 1;
 uint16_t sample_count = 0;
-int k = 2; // used to adjust the sensitivity of outlier detection
-
+int waiting_dis = 0;
+char distance_str[32];
+uint8_t distance_index = 0;
 
 /* USER CODE END PV */
 
@@ -128,7 +131,7 @@ int main(void)
   HAL_TIM_Base_Start(&htim6);		// Timer to count to 10 microseconds
   HAL_TIM_Base_Start_IT(&htim7);  //Timer to trigger ultrasonic, always put base start above
   HAL_TIM_IC_Start_IT(&htim1,TIM_CHANNEL_1);		// Timer to measure distance
-  HAL_UART_Receive_IT(&huart2,(uint8_t*)uart_buffer,1);  // Receive 1 byte at a time
+  HAL_UART_Receive_IT(&huart2,&uart_buffer,1);  // Receive 1 byte at a time
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -358,7 +361,7 @@ static void MX_TIM7_Init(void)
 
   /* USER CODE END TIM7_Init 1 */
   htim7.Instance = TIM7;
-  htim7.Init.Prescaler = 100-1;
+  htim7.Init.Prescaler = 32000-1;
   htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim7.Init.Period = 50-1;
   htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -457,49 +460,72 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef * hspi) {
+#define FILTER_WINDOW 3  // Size of the median filter window
+#define AVG_WINDOW 3     // Size of the averaging window
+
+// Global buffers
+
+void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi) {
     if (hspi == &hspi1) {
-        // Convert 2 bytes to 12-bit ADC value
+        //Get new ADC value
         uint16_t new_value = RX_Buffer[0] | (RX_Buffer[1] << 8);
 
-        // Store the value in the circular buffer
+        //Store raw value in circular buffer
         ADC_filter_buffer[buffer_index] = new_value;
-        buffer_index = (buffer_index + 1) % 3;
 
+        //Update initialization status
         if (initialized < 3) {
             initialized++;
         }
 
-        uint16_t filtered_value;
+        uint16_t filtered_value = 0;
 
-        if (initialized < 3) {
-            // Not enough samples yet, average whatever is available
-            int sum = 0;
+        //Median filtering (outlier removal)
+        if (initialized >= 3) {
+            // Sort the three values to find median
+            uint16_t a = ADC_filter_buffer[0];
+            uint16_t b = ADC_filter_buffer[1];
+            uint16_t c = ADC_filter_buffer[2];
+
+            // Median is the middle value
+            if ((a >= b && a <= c) || (a <= b && a >= c)) {
+                filtered_value = a;
+            } else if ((b >= a && b <= c) || (b <= a && b >= c)) {
+                filtered_value = b;
+            } else {
+                filtered_value = c;
+            }
+
+            // Store median in averaging buffer
+            median_buffer[buffer_index] = filtered_value;
+
+            // Calculate average of medians
+            uint32_t sum = 0;
+            for (int i = 0; i < 3; i++) {
+                sum += median_buffer[i];
+            }
+            filtered_value = sum / 3;
+        } else {
+            // During initialization, just use the raw average
+            uint32_t sum = 0;
             for (int i = 0; i < initialized; i++) {
                 sum += ADC_filter_buffer[i];
             }
             filtered_value = sum / initialized;
-        } else {
-            // Outlier removal using min-max exclusion (only valid when we have 3 samples)
-            uint16_t a = ADC_filter_buffer[0];
-            uint16_t b = ADC_filter_buffer[1];
-            uint16_t c = ADC_filter_buffer[2];
-            // Return the median of the three (the one that is not min or max)
-            if ((a >= b && a <= c) || (a <= b && a >= c))
-                filtered_value = a;
-            else if ((b >= a && b <= c) || (b <= a && b >= c))
-                filtered_value = b;
-            else
-                filtered_value = c;
         }
 
+        // Update buffer index
+        buffer_index = (buffer_index + 1) % 3;
+
+        // Send data if enabled
         sample_count++;
-        if (recording_enabled == 1 && sample_count % 2 == 0) {
+        if (recording_enabled && (sample_count % 2 == 0)) {
             uint8_t mapped_value = filtered_value >> 4;  // 12-bit to 8-bit
             HAL_UART_Transmit_IT(&huart2, &mapped_value, 1);
         }
 
-        HAL_SPI_Receive_IT(&hspi1, RX_Buffer, 2);  // Restart SPI reception
+        // Restart SPI reception
+        HAL_SPI_Receive_IT(&hspi1, RX_Buffer, 2);
     }
 }
 
@@ -507,17 +533,42 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART2)
     {
-    	if (uart_buffer[0] == 'M') {
-    	    		distance_mode = 0;
-    	    		recording_enabled = 1;
-    	    		HAL_GPIO_WritePin (GPIOB,GPIO_PIN_3,GPIO_PIN_RESET);
-    	}
-        // distance trigger mode
-    	if (uart_buffer[0] == 'D') {
-    		distance_mode = 1;
-    	}
-    	// Re-enable UART interrupt
-    	HAL_UART_Receive_IT(&huart2, uart_buffer, 1);
+        if (!waiting_dis) {
+            // Expecting a mode command
+            if (uart_buffer == 'M') {
+                distance_mode = 0;
+                waiting_dis = 0;
+                recording_enabled = 1;
+                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_3, GPIO_PIN_RESET);
+            }
+            else if (uart_buffer == 'D') {
+                distance_mode = 1;
+                waiting_dis = 1;
+                distance_index = 0;
+            }
+        }
+        else {
+            // Expecting distance digits
+            if (uart_buffer >= '0' && uart_buffer <= '9') { //here a single uart_buffer contains a single character stored in ascii
+                if (distance_index < 32 - 1) { //-1 for null character
+                    distance_str[distance_index++] = uart_buffer;
+                }
+            }
+            else if (uart_buffer == '\n') { //if newline received marks end
+
+                distance_str[distance_index] = '\0';
+                min_distance = atoi(distance_str);
+                waiting_dis = 0;
+            }
+            else {
+                // Invalid input
+                distance_index = 0;
+                waiting_dis = 0;
+            }
+        }
+
+        // Always re-enable UART RX interrupt
+        HAL_UART_Receive_IT(&huart2, &uart_buffer, 1);
     }
 }
 
@@ -568,7 +619,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 			count_2 = HAL_TIM_ReadCapturedValue(&htim1, TIM_CHANNEL_1);
 
 			__HAL_TIM_SET_COUNTER(htim,0);
-			distance = (count_2-count_1)/58.0;
+			distance = ((count_2-count_1)/58.0)/2;
 			flag = 0;
 		}
 
